@@ -1,7 +1,7 @@
 const express = require('express');
 const {
   HttpError, round2, parseAmount, parseId, asyncHandler, authenticate,
-  withUser, addTx, settleFlex, formatGoal,
+  withUser, addTx, formatGoal,
 } = require('../helpers');
 
 const router = express.Router();
@@ -13,14 +13,14 @@ const GOAL_COLUMNS = `id, name, target_amount, saved_amount,
 
 // GET /api/goals
 router.get('/', asyncHandler(async (req, res) => {
-  const goals = await withUser(req.userId, async (client, user) => {
+  const out = await withUser(req.userId, async (client, user) => {
     const r = await client.query(
       'SELECT ' + GOAL_COLUMNS + ' FROM goals WHERE user_id = $1 ORDER BY created_at DESC',
       [user.id]
     );
     return { goals: r.rows.map(formatGoal), flex_balance: Number(user.flex_balance) };
   });
-  res.json(goals);
+  res.json(out);
 }));
 
 // POST /api/goals  { name, target_amount, deadline: "YYYY-MM-DD" }
@@ -37,7 +37,7 @@ router.post('/', asyncHandler(async (req, res) => {
     throw new HttpError(400, 'Deadline must be a future date');
   }
 
-  const out = await withUser(req.userId, async (client, user) => {
+  const goal = await withUser(req.userId, async (client, user) => {
     const r = await client.query(
       `INSERT INTO goals (user_id, name, target_amount, deadline)
        VALUES ($1,$2,$3,$4)
@@ -46,10 +46,10 @@ router.post('/', asyncHandler(async (req, res) => {
     );
     return formatGoal(r.rows[0]);
   });
-  res.status(201).json({ message: 'Goal created', goal: out });
+  res.status(201).json({ message: 'Goal created', goal });
 }));
 
-// POST /api/goals/:id/deposit  { amount }  (money comes from your Flex wallet)
+// POST /api/goals/:id/deposit  { amount }  (money comes from the Flex wallet)
 router.post('/:id/deposit', asyncHandler(async (req, res) => {
   const id = parseId(req.params.id);
   const amount = parseAmount(req.body.amount);
@@ -67,9 +67,7 @@ router.post('/:id/deposit', asyncHandler(async (req, res) => {
     if (amount > left) {
       throw new HttpError(400, 'You only need $' + left.toFixed(2) + ' more to reach this goal');
     }
-
-    const settled = await settleFlex(client, user, true);
-    if (Number(settled.user.flex_balance) < amount) {
+    if (Number(user.flex_balance) < amount) {
       throw new HttpError(400, 'Not enough money in your Flex wallet. Deposit first.');
     }
 
@@ -86,7 +84,7 @@ router.post('/:id/deposit', asyncHandler(async (req, res) => {
   res.json({ message: '$' + amount.toFixed(2) + ' added to your goal', ...out });
 }));
 
-// DELETE /api/goals/:id  -> removes the goal and returns saved money to Flex wallet
+// DELETE /api/goals/:id  (saved money returns to the Flex wallet)
 router.delete('/:id', asyncHandler(async (req, res) => {
   const id = parseId(req.params.id);
   const out = await withUser(req.userId, async (client, user) => {
@@ -98,7 +96,6 @@ router.delete('/:id', asyncHandler(async (req, res) => {
     if (!goal) throw new HttpError(404, 'Goal not found');
 
     const saved = Number(goal.saved_amount);
-    await settleFlex(client, user, true);
     if (saved > 0) {
       await client.query('UPDATE users SET flex_balance = flex_balance + $1 WHERE id = $2', [saved, user.id]);
       await addTx(client, user.id, 'goal_refund', 'goal', saved, 'Goal removed: ' + goal.name);
