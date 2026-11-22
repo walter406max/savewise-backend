@@ -1,9 +1,8 @@
 const express = require('express');
 const { query } = require('../db');
 const {
-  FLEX_RATE, LOCK_RATE, DAY_MS, HttpError, round2, parseAmount, parseId,
-  asyncHandler, authenticate, withUser, addTx, flexPending, settleFlex,
-  lockPending, formatLock, formatGoal, formatTx,
+  DAY_MS, HttpError, round2, parseAmount, parseId, asyncHandler,
+  authenticate, withUser, addTx, formatLock, formatGoal, formatTx,
 } = require('../helpers');
 
 const router = express.Router();
@@ -19,8 +18,7 @@ function addPeriod(date, frequency) {
   return d;
 }
 
-// Autosave runs "lazily": whenever you open the app, any rule that is due
-// is executed (free Render servers sleep, so no background timer is possible).
+// Autosave runs when the user opens the app (free servers sleep, so there is no background timer).
 async function processAutosave(client, user) {
   const now = new Date();
   const due = await client.query(
@@ -31,10 +29,7 @@ async function processAutosave(client, user) {
   );
   if (!due.rows.length) return user;
 
-  const settled = await settleFlex(client, user, true);
-  const u = settled.user;
   let grand = 0;
-
   for (const rule of due.rows) {
     let next = new Date(rule.next_run);
     let runs = 0;
@@ -47,7 +42,7 @@ async function processAutosave(client, user) {
     const total = round2(Number(rule.amount) * runs);
     await client.query('UPDATE autosave_rules SET next_run = $1 WHERE id = $2', [next, rule.id]);
     await addTx(
-      client, u.id, 'autosave', 'flex', total,
+      client, user.id, 'autosave', 'flex', total,
       'Autosave (' + rule.frequency + ')' + (runs > 1 ? ' x' + runs : '')
     );
     grand += total;
@@ -55,12 +50,12 @@ async function processAutosave(client, user) {
 
   const r = await client.query(
     'UPDATE users SET flex_balance = flex_balance + $1 WHERE id = $2 RETURNING *',
-    [round2(grand), u.id]
+    [round2(grand), user.id]
   );
   return r.rows[0];
 }
 
-// GET /api/wallet/summary  -> everything the dashboard needs
+// GET /api/wallet/summary
 router.get('/summary', asyncHandler(async (req, res) => {
   const data = await withUser(req.userId, async (client, startUser) => {
     const user = await processAutosave(client, startUser);
@@ -87,17 +82,13 @@ router.get('/summary', asyncHandler(async (req, res) => {
     const flex = Number(user.flex_balance);
     const lockedTotal = round2(locks.reduce((s, l) => s + Number(l.amount), 0));
     const goalsTotal = round2(goals.reduce((s, g) => s + Number(g.saved_amount), 0));
-    const flexInterest = flexPending(user, now);
-    const lockInterest = round2(locks.reduce((s, l) => s + lockPending(l, now), 0));
 
     return {
       user: { id: user.id, full_name: user.full_name, email: user.email },
       total_balance: round2(flex + lockedTotal + goalsTotal),
-      total_interest: Number(user.total_interest),
-      pending_interest: round2(flexInterest + lockInterest),
       wallets: {
-        flex: { balance: flex, rate: FLEX_RATE, pending_interest: flexInterest },
-        safelock: { total: lockedTotal, count: locks.length, rate: LOCK_RATE, pending_interest: lockInterest },
+        flex: { balance: flex },
+        safelock: { total: lockedTotal, count: locks.length },
         goals: { total: goalsTotal, count: goals.length },
       },
       goals: goals.map(formatGoal),
@@ -112,10 +103,9 @@ router.get('/summary', asyncHandler(async (req, res) => {
 router.post('/deposit', asyncHandler(async (req, res) => {
   const amount = parseAmount(req.body.amount);
   const out = await withUser(req.userId, async (client, user) => {
-    const settled = await settleFlex(client, user, true);
     const r = await client.query(
       'UPDATE users SET flex_balance = flex_balance + $1 WHERE id = $2 RETURNING flex_balance',
-      [amount, settled.user.id]
+      [amount, user.id]
     );
     await addTx(client, user.id, 'deposit', 'flex', amount, 'Deposit to Flex wallet');
     return { flex_balance: Number(r.rows[0].flex_balance) };
@@ -127,8 +117,7 @@ router.post('/deposit', asyncHandler(async (req, res) => {
 router.post('/withdraw', asyncHandler(async (req, res) => {
   const amount = parseAmount(req.body.amount);
   const out = await withUser(req.userId, async (client, user) => {
-    const settled = await settleFlex(client, user, true);
-    if (Number(settled.user.flex_balance) < amount) {
+    if (Number(user.flex_balance) < amount) {
       throw new HttpError(400, 'Not enough money in your Flex wallet');
     }
     const r = await client.query(
@@ -139,54 +128,6 @@ router.post('/withdraw', asyncHandler(async (req, res) => {
     return { flex_balance: Number(r.rows[0].flex_balance) };
   });
   res.json({ message: '$' + amount.toFixed(2) + ' withdrawn', ...out });
-}));
-
-// POST /api/wallet/claim-interest  -> adds Flex + SafeLock interest to Flex wallet
-router.post('/claim-interest', asyncHandler(async (req, res) => {
-  const out = await withUser(req.userId, async (client, user) => {
-    const now = new Date();
-    const settled = await settleFlex(client, user, false);
-    let u = settled.user;
-
-    const locks = (await client.query(
-      `SELECT * FROM safelocks WHERE user_id = $1 AND status = 'active' FOR UPDATE`,
-      [u.id]
-    )).rows;
-
-    let lockTotal = 0;
-    for (const lock of locks) {
-      const interest = lockPending(lock, now);
-      if (interest >= 0.01) {
-        await client.query(
-          'UPDATE safelocks SET interest_earned = interest_earned + $1, last_claim = $2 WHERE id = $3',
-          [interest, now, lock.id]
-        );
-        lockTotal = round2(lockTotal + interest);
-      }
-    }
-
-    if (lockTotal >= 0.01) {
-      const r = await client.query(
-        `UPDATE users
-           SET flex_balance = flex_balance + $1, total_interest = total_interest + $1
-         WHERE id = $2 RETURNING *`,
-        [lockTotal, u.id]
-      );
-      u = r.rows[0];
-      await addTx(client, u.id, 'interest', 'safelock', lockTotal, 'SafeLock interest (' + LOCK_RATE + '% p.a.)');
-    }
-
-    const total = round2(settled.credited + lockTotal);
-    if (total < 0.01) {
-      throw new HttpError(400, 'No interest to claim yet. It grows every day, check back soon!');
-    }
-    return {
-      claimed: total,
-      flex_balance: Number(u.flex_balance),
-      total_interest: Number(u.total_interest),
-    };
-  });
-  res.json({ message: '$' + out.claimed.toFixed(2) + ' interest added to your Flex wallet', ...out });
 }));
 
 // GET /api/wallet/transactions?limit=100
@@ -208,18 +149,17 @@ router.get('/safelock', asyncHandler(async (req, res) => {
     [req.userId]
   );
   const now = new Date();
-  res.json({ rate: LOCK_RATE, safelocks: r.rows.map((l) => formatLock(l, now)) });
+  res.json({ safelocks: r.rows.map((l) => formatLock(l, now)) });
 }));
 
-// POST /api/wallet/safelock  { amount, days }  (days = 30, 60 or 90)
+// POST /api/wallet/safelock  { amount, days }  (30, 60 or 90)
 router.post('/safelock', asyncHandler(async (req, res) => {
   const amount = parseAmount(req.body.amount);
   const days = Number(req.body.days);
   if (![30, 60, 90].includes(days)) throw new HttpError(400, 'Choose 30, 60 or 90 days');
 
   const out = await withUser(req.userId, async (client, user) => {
-    const settled = await settleFlex(client, user, true);
-    if (Number(settled.user.flex_balance) < amount) {
+    if (Number(user.flex_balance) < amount) {
       throw new HttpError(400, 'Not enough money in your Flex wallet. Deposit first.');
     }
     const now = new Date();
@@ -227,9 +167,9 @@ router.post('/safelock', asyncHandler(async (req, res) => {
 
     await client.query('UPDATE users SET flex_balance = flex_balance - $1 WHERE id = $2', [amount, user.id]);
     const r = await client.query(
-      `INSERT INTO safelocks (user_id, amount, rate, lock_days, start_date, end_date, last_claim)
-       VALUES ($1,$2,$3,$4,$5,$6,$5) RETURNING *`,
-      [user.id, amount, LOCK_RATE, days, now, end]
+      `INSERT INTO safelocks (user_id, amount, lock_days, start_date, end_date)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [user.id, amount, days, now, end]
     );
     await addTx(client, user.id, 'safelock_lock', 'safelock', amount, 'Locked for ' + days + ' days');
     return { safelock: formatLock(r.rows[0], now) };
@@ -237,7 +177,7 @@ router.post('/safelock', asyncHandler(async (req, res) => {
   res.status(201).json({ message: '$' + amount.toFixed(2) + ' locked for ' + days + ' days', ...out });
 }));
 
-// POST /api/wallet/safelock/:id/withdraw  -> only works after the lock date
+// POST /api/wallet/safelock/:id/withdraw  (only after the unlock date)
 router.post('/safelock/:id/withdraw', asyncHandler(async (req, res) => {
   const id = parseId(req.params.id);
   const out = await withUser(req.userId, async (client, user) => {
@@ -248,33 +188,19 @@ router.post('/safelock/:id/withdraw', asyncHandler(async (req, res) => {
     const lock = found.rows[0];
     if (!lock) throw new HttpError(404, 'SafeLock not found');
 
-    const now = new Date();
     const end = new Date(lock.end_date);
-    if (now < end) {
-      throw new HttpError(400, 'This money is locked until ' + end.toDateString() + '. You cannot withdraw early.');
+    if (new Date() < end) {
+      throw new HttpError(400, 'This money is locked until ' + end.toDateString() + '. It cannot be withdrawn early.');
     }
 
-    const interest = lockPending(lock, now);
     const principal = Number(lock.amount);
-
-    await settleFlex(client, user, true);
-    await client.query(
-      `UPDATE safelocks
-         SET status = 'withdrawn', interest_earned = interest_earned + $1, last_claim = $2
-       WHERE id = $3`,
-      [interest, now, lock.id]
-    );
+    await client.query(`UPDATE safelocks SET status = 'withdrawn' WHERE id = $1`, [lock.id]);
     const r = await client.query(
-      `UPDATE users
-         SET flex_balance = flex_balance + $1, total_interest = total_interest + $2
-       WHERE id = $3 RETURNING flex_balance`,
-      [round2(principal + interest), interest, user.id]
+      'UPDATE users SET flex_balance = flex_balance + $1 WHERE id = $2 RETURNING flex_balance',
+      [principal, user.id]
     );
     await addTx(client, user.id, 'safelock_unlock', 'safelock', principal, 'SafeLock matured, moved to Flex wallet');
-    if (interest >= 0.01) {
-      await addTx(client, user.id, 'interest', 'safelock', interest, 'SafeLock interest (' + LOCK_RATE + '% p.a.)');
-    }
-    return { paid_out: round2(principal + interest), flex_balance: Number(r.rows[0].flex_balance) };
+    return { paid_out: principal, flex_balance: Number(r.rows[0].flex_balance) };
   });
   res.json({ message: '$' + out.paid_out.toFixed(2) + ' moved to your Flex wallet', ...out });
 }));
@@ -299,7 +225,7 @@ router.get('/autosave', asyncHandler(async (req, res) => {
   res.json({ rules });
 }));
 
-// POST /api/wallet/autosave  { amount, frequency }  (daily | weekly | monthly)
+// POST /api/wallet/autosave  { amount, frequency }
 router.post('/autosave', asyncHandler(async (req, res) => {
   const amount = parseAmount(req.body.amount, 100000);
   const frequency = String(req.body.frequency || '').toLowerCase();
@@ -311,12 +237,12 @@ router.post('/autosave', asyncHandler(async (req, res) => {
       'INSERT INTO autosave_rules (user_id, amount, frequency, next_run) VALUES ($1,$2,$3,$4)',
       [user.id, amount, frequency, new Date()]
     );
-    await processAutosave(client, user); // first save happens right away
+    await processAutosave(client, user); // first save runs right away
   });
   res.status(201).json({ message: 'Autosave of $' + amount.toFixed(2) + ' (' + frequency + ') is on' });
 }));
 
-// DELETE /api/wallet/autosave/:id  -> stop a rule
+// DELETE /api/wallet/autosave/:id
 router.delete('/autosave/:id', asyncHandler(async (req, res) => {
   const id = parseId(req.params.id);
   const r = await query(
